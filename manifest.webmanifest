@@ -1,0 +1,16 @@
+{
+  "name": "Animés · Tom",
+  "short_name": "Animés",
+  "description": "Ma liste d'animés : suivi, catégories, commentaires et planning des épisodes",
+  "lang": "fr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#07060d",
+  "theme_color": "#07060d",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
