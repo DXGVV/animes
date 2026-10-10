@@ -6,7 +6,7 @@
    Données stockées uniquement sur le téléphone (localStorage)
    ========================================================= */
 
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.1.0';
 const STORE_KEY = 'animes-tom-v1';
 const UI_KEY = 'animes-tom-ui';
 const WALL_KEY = 'animes-tom-wall';
@@ -233,11 +233,13 @@ function freshDb() {
     settings: {
       titleLang: 'romaji', theme: 'neon', heroName: 'Tom',
       wall: { mode: 'auto', uid: null, blur: 14, dim: 0.62 },
+      reco: true,
     },
     categories: DEFAULT_CATS.map((c) => ({ id: uid(), ...c })),
     items: [],
     achievements: {},
     stats: { gacha: 0, night: false },
+    dismissed: [],
     lastRefresh: 0,
   };
 }
@@ -248,6 +250,7 @@ function normalizeDb(d) {
   d.categories = Array.isArray(d.categories) ? d.categories : [];
   d.achievements = d.achievements || {};
   d.stats = { ...f.stats, ...(d.stats || {}) };
+  d.dismissed = Array.isArray(d.dismissed) ? d.dismissed : [];
   d.items.forEach((i) => { i.categories = i.categories || []; i.notes = i.notes || []; i.ids = i.ids || {}; });
   d.version = 2;
   return d;
@@ -911,6 +914,165 @@ function openGacha() {
 }
 
 /* =========================================================
+   Suggestions du Simulcast : un animé par créneau libre
+   Basé sur tes notes, statuts, favoris, genres et tags.
+   ========================================================= */
+const WEEK_KEY = 'animes-tom-week';
+let week = null;  // { at, from, list: [{ m, episode, airingAt, pop, prequels }] }
+let pool = null;  // { at, list: [{ m, pop, prequels }] } séries terminées dans tes genres
+const reco = { loading: false, err: false };
+
+/** Profil de goûts : poids par genre / tag */
+function tasteProfile() {
+  const w = {};
+  const add = (k, v) => { w[k] = (w[k] || 0) + v; };
+  let n = 0;
+  for (const i of db.items) {
+    let s;
+    if (i.rating != null) s = (i.rating - 6) / 2;              // 10 → +2 · 6 → 0 · 4 → −1
+    else if (i.status === 'completed') s = 0.8;
+    else if (i.status === 'watching') s = 0.6;
+    else if (i.status === 'dropped') s = -1;
+    else if (i.status === 'planning') s = 0.25;
+    else s = 0.2;
+    if (i.status === 'dropped' && i.rating == null) s = -1;
+    if (i.favorite) s += 1;
+    if (!s) continue;
+    n++;
+    (i.genres || []).forEach((g) => add('g:' + g, s));
+    (i.tags || []).forEach((t) => add('t:' + t, s * 0.6));
+  }
+  const max = Math.max(1, ...Object.values(w).map(Math.abs));
+  return { w, n, max };
+}
+function similarity(m, prof) {
+  if (!prof.n) return 0;
+  let s = 0, cnt = 0;
+  (m.genres || []).forEach((g) => { s += prof.w['g:' + g] || 0; cnt += 1; });
+  (m.tags || []).forEach((t) => { s += prof.w['t:' + t] || 0; cnt += 0.6; });
+  return s / (prof.max * Math.sqrt(Math.max(cnt, 1)));
+}
+/** Note un candidat + explique pourquoi */
+function rankCandidate(m, prof, extra = {}) {
+  const sim = similarity(m, prof);
+  let r = sim * 2.2 + ((m.score || 6.5) - 7) * 0.35 + Math.log10((extra.pop || 1000) + 1) * 0.08;
+  const why = [];
+  if (extra.prequels?.length) {
+    const pre = db.items.find((i) => extra.prequels.includes(i.ids.al));
+    if (pre) {
+      const liked = pre.status !== 'dropped' && (pre.rating == null || pre.rating >= 6);
+      r += liked ? 1.6 : -2;
+      if (liked) why.push(`Suite de ${titleOf(pre)}${pre.rating != null ? ` (${tierOf(pre.rating).t})` : ''}`);
+    } else r -= 1.2; // suite d'une série que tu n'as pas vue
+  }
+  if (extra.backlog) { r += 0.6; why.push('Déjà dans ta liste « À voir »'); }
+  if (prof.n) {
+    const liked = [...(m.genres || []).map((g) => [g, prof.w['g:' + g] || 0]), ...(m.tags || []).map((t) => [t, (prof.w['t:' + t] || 0) * 0.8])]
+      .filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => k);
+    if (liked.length) why.push(`Tu kiffes ${liked.join(', ')}`);
+    // l'animé de ta liste le plus proche parmi ceux que tu as aimés
+    const mk = new Set([...(m.genres || []), ...(m.tags || [])]);
+    let best = null, bestN = 1;
+    for (const i of db.items) {
+      if (!(i.favorite || (i.rating != null && i.rating >= 7.5))) continue;
+      if (extra.prequels?.includes(i.ids.al)) continue;
+      const n = [...(i.genres || []), ...(i.tags || [])].filter((x) => mk.has(x)).length;
+      if (n > bestN || (n === bestN && best && (i.rating || 0) > (best.rating || 0))) { best = i; bestN = n; }
+    }
+    if (best) why.push(`Dans la veine de ${titleOf(best)}${best.rating != null ? ` (${tierOf(best.rating).t})` : ''}`);
+  } else {
+    why.push('Populaire en ce moment (note quelques animés pour des suggestions sur mesure)');
+  }
+  const pct = clamp(Math.round(50 + 45 * Math.tanh(sim * 1.3)), 5, 99);
+  return { r, pct, why: why.slice(0, 3) };
+}
+
+/** Tous les épisodes diffusés cette semaine (tous animés confondus) */
+async function loadWeek(force) {
+  const from = Math.floor(startOfDay() / 1000), to = from + 7 * 86400;
+  const fresh = (c) => c && c.from === from && Date.now() - c.at < 6 * 3600 * 1000;
+  if (!force && fresh(week)) return week;
+  if (!force) {
+    try { const c = JSON.parse(localStorage.getItem(WEEK_KEY)); if (fresh(c)) { week = c; return week; } } catch (e) { /* rien */ }
+  }
+  const list = [];
+  for (let p = 1; p <= 6; p++) {
+    const d = await alQuery(`query($from:Int,$to:Int,$p:Int){Page(page:$p,perPage:50){pageInfo{hasNextPage}
+      airingSchedules(airingAt_greater:$from,airingAt_lesser:$to,sort:TIME){episode airingAt
+        media{${AL_FIELDS} isAdult popularity relations{edges{relationType node{id}}}}}}}`, { from, to, p });
+    for (const s of d.Page.airingSchedules) {
+      const M = s.media;
+      if (!M || M.isAdult || M.type !== 'ANIME' || !['TV', 'TV_SHORT', 'ONA'].includes(M.format)) continue;
+      const m = fromAL(M); m.synopsis = (m.synopsis || '').slice(0, 700);
+      list.push({ m, episode: s.episode, airingAt: s.airingAt, pop: M.popularity || 0,
+        prequels: (M.relations?.edges || []).filter((e) => e.relationType === 'PREQUEL' && e.node).map((e) => e.node.id) });
+    }
+    if (!d.Page.pageInfo.hasNextPage) break;
+  }
+  week = { at: Date.now(), from, list };
+  try { localStorage.setItem(WEEK_KEY, JSON.stringify(week)); } catch (e) { /* stockage plein : on garde en mémoire */ }
+  return week;
+}
+/** Séries terminées populaires dans tes genres préférés (pour les jours sans bon simulcast) */
+async function loadPool(prof) {
+  if (pool && Date.now() - pool.at < 12 * 3600 * 1000) return pool;
+  const topG = Object.entries(prof.w).filter(([k, v]) => k.startsWith('g:') && v > 0).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => k.slice(2));
+  const list = [];
+  for (let p = 1; p <= 2; p++) {
+    const d = await alQuery(`query($p:Int${topG.length ? ',$g:[String]' : ''}){Page(page:$p,perPage:50){media(type:ANIME,isAdult:false,status:FINISHED,format_in:[TV,ONA],${topG.length ? 'genre_in:$g,' : ''}sort:[POPULARITY_DESC]){
+      ${AL_FIELDS} popularity relations{edges{relationType node{id}}}}}}`, topG.length ? { p, g: topG } : { p });
+    d.Page.media.forEach((M) => list.push({ m: fromAL(M), pop: M.popularity || 0,
+      prequels: (M.relations?.edges || []).filter((e) => e.relationType === 'PREQUEL' && e.node).map((e) => e.node.id) }));
+  }
+  pool = { at: Date.now(), list };
+  return pool;
+}
+function ensureReco() {
+  if (db.settings.reco === false || reco.loading) return;
+  const from = Math.floor(startOfDay() / 1000);
+  if (week && week.from === from && Date.now() - week.at < 6 * 3600 * 1000 && pool) return;
+  reco.loading = true;
+  Promise.allSettled([loadWeek(), loadPool(tasteProfile())]).then((r) => {
+    reco.loading = false;
+    reco.err = r[0].status === 'rejected';
+    if (r[1].status === 'rejected') pool = { at: Date.now() - 11 * 3600 * 1000, list: [] };
+    if (ui.tab === 'planning' && $('#sheet').hidden) render();
+  });
+}
+
+/** Construit la semaine : pour chaque jour sans épisode de ta liste, une suggestion */
+const rerolls = {};
+function weekPlan(days) {
+  if (db.settings.reco === false) return days.map(() => null);
+  const prof = tasteProfile();
+  const dismissed = new Set(db.dismissed || []);
+  const used = new Set();
+  const ok = (m) => !findItem(m) && !dismissed.has(keyOf(m));
+  const airing = (week?.list || []).filter((e) => ok(e.m)).map((e) => ({ ...e, kind: 'airing', ...rankCandidate(e.m, prof, e) }));
+  const backlogIds = new Set();
+  const backlog = db.items.filter((i) => i.status === 'planning' && !dismissed.has(i.uid))
+    .map((i) => { backlogIds.add(i.uid); return { m: i, kind: 'backlog', ...rankCandidate(i, prof, { backlog: true }) }; });
+  const catalog = [...backlog, ...(pool?.list || []).filter((e) => ok(e.m)).map((e) => ({ ...e, kind: 'catalog', ...rankCandidate(e.m, prof, e) }))]
+    .sort((a, b) => b.r - a.r);
+
+  return days.map((day) => {
+    if (day.eps.length) return null;
+    const start = day.start / 1000, end = start + 86400;
+    const pickFrom = (arr) => {
+      const valid = arr.filter((c) => !used.has(keyOf(c.m)));
+      if (!valid.length) return null;
+      return valid[(rerolls[day.d] || 0) % valid.length];
+    };
+    const todays = airing.filter((c) => c.airingAt >= start && c.airingAt < end && c.pct >= 55).sort((a, b) => b.r - a.r);
+    // On préfère un simulcast du jour ; s'il n'y en a pas de bien noté, une série terminée à binger
+    let s = todays.length && (rerolls[day.d] || 0) < todays.length ? pickFrom(todays) : null;
+    if (!s) s = pickFrom(catalog.length ? catalog : todays);
+    if (s) used.add(keyOf(s.m));
+    return s;
+  });
+}
+
+/* =========================================================
    Vues
    ========================================================= */
 const TITLES = {
@@ -1169,17 +1331,21 @@ function renderPlanning(v) {
       const eps = sched.list.filter((e) => e.airingAt * 1000 >= start && e.airingAt * 1000 < end && byAl.has(e.mediaId));
       days.push({ start, eps, d });
     }
-    if (ui.day == null || !days[ui.day]) ui.day = Math.max(0, days.findIndex((x) => x.eps.length));
+    if (ui.day == null || !days[ui.day]) ui.day = 0;
+    const plan = weekPlan(days);
+    const recoOn = db.settings.reco !== false;
     html += `<div class="days">${days.map((x) => {
       const dt = new Date(x.start);
       return `<button class="${x.d === ui.day ? 'on' : ''} ${x.d === 0 ? 'today' : ''}" data-act="day" data-v="${x.d}">
-        ${x.eps.length ? `<span class="n">${x.eps.length}</span>` : ''}<span class="k">${KANJI_DAYS[dt.getDay()]}</span><span class="d">${x.d === 0 ? 'auj.' : dt.getDate()}</span></button>`;
+        ${x.eps.length ? `<span class="n">${x.eps.length}</span>` : plan[x.d] ? '<span class="n spark">✦</span>' : ''}<span class="k">${KANJI_DAYS[dt.getDay()]}</span><span class="d">${x.d === 0 ? 'auj.' : dt.getDate()}</span></button>`;
     }).join('')}</div>`;
     const day = days[ui.day];
     const label = ui.day === 0 ? "Aujourd'hui" : ui.day === 1 ? 'Demain' : fmtDay.format(day.start);
     html += `<div class="small muted" style="margin:-4px 0 10px;font-weight:800">${esc(label.charAt(0).toUpperCase() + label.slice(1))}${ui.day <= 1 ? ' · ' + esc(fmtDay.format(day.start)) : ''}</div>`;
     if (!day.eps.length) {
-      html += `<div class="panel small muted" style="text-align:center">Aucun épisode ce jour-là. Le calme avant l'arc final.</div>`;
+      if (plan[ui.day]) html += sugCardHTML(plan[ui.day], ui.day);
+      else if (recoOn && (reco.loading || !week)) html += `<div class="loading-quip">Recherche d'un animé pour ce créneau libre…</div><div class="skeleton" style="height:190px;border-radius:22px"></div>`;
+      else html += `<div class="panel small muted" style="text-align:center">Aucun épisode ce jour-là. Le calme avant l'arc final.${recoOn && reco.err ? '<br>Suggestions indisponibles (AniList ne répond pas).' : ''}</div>`;
     } else {
       html += `<div class="rows">${day.eps.map((e) => {
         const i = byAl.get(e.mediaId);
@@ -1191,6 +1357,22 @@ function renderPlanning(v) {
             <div><span class="num">Épisode ${e.episode}${i.episodes ? '/' + i.episodes : ''}</span> <span class="status-pill" style="--sc:${STATUSES[i.status].c};margin-left:6px">${STATUSES[i.status].label}</span></div>
             <div class="tiny muted" style="margin-top:4px">Vu jusqu'à l'ép. ${i.progress || 0}</div></div>
         </div>`;
+      }).join('')}</div>`;
+    }
+
+    // Vue d'ensemble : un animé par jour
+    if (recoOn && plan.some(Boolean)) {
+      html += `${h2('Ta semaine', 'いっしゅうかん', 'un animé par jour')}<div class="weekplan">${days.map((x) => {
+        const dt = new Date(x.start);
+        const mine = x.eps.map((e) => byAl.get(e.mediaId)).filter(Boolean);
+        const s = plan[x.d];
+        const name = x.d === 0 ? "Auj." : fmtDay.format(x.start).slice(0, 3) + '.';
+        let content;
+        if (mine.length) content = mine.map((i) => `<span class="wp-it">${img(i.cover)}<span>${esc(titleOf(i))}</span></span>`).join('');
+        else if (s) content = `<span class="wp-it sug">${img(s.m.cover)}<span>✦ ${esc(titleOf(s.m))}</span></span>`;
+        else content = '<span class="muted tiny">—</span>';
+        return `<button class="wp-row ${x.d === ui.day ? 'on' : ''}" data-act="day" data-v="${x.d}">
+          <span class="wp-day"><b>${KANJI_DAYS[dt.getDay()]}</b><small>${esc(name)}</small></span><span class="wp-list">${content}</span></button>`;
       }).join('')}</div>`;
     }
   }
@@ -1207,7 +1389,7 @@ function renderPlanning(v) {
     }).join('')}</div>`;
   }
 
-  if (!items.length && !behindList.length) {
+  if (!items.length && !behindList.length && db.settings.reco === false) {
     html = `<div class="empty panel"><div class="speedlines"></div><div class="big">📺</div><b>Rien à suivre pour l'instant</b>
       Ajoute des animés en cours de diffusion (« En cours » ou « À voir ») : leurs épisodes apparaîtront ici, à l'heure française.<br><br>
       <button class="btn primary" data-act="disc" data-v="season">Voir la saison en cours</button></div>`;
@@ -1215,8 +1397,43 @@ function renderPlanning(v) {
   v.innerHTML = html;
 
   if (Date.now() - sched.at > 20 * 60 * 1000) {
-    loadSchedule().then(() => { if (ui.tab === 'planning') renderPlanning($('#view')); });
+    loadSchedule().then(() => { if (ui.tab === 'planning' && $('#sheet').hidden) renderPlanning($('#view')); });
   }
+  ensureReco();
+}
+
+function sugCardHTML(s, d) {
+  const m = s.m;
+  mediaCache.set(keyOf(m), m);
+  const inList = findItem(m);
+  let when;
+  if (s.kind === 'airing') {
+    const before = s.episode - 1;
+    when = `📡 Épisode ${s.episode} à ${fmtTime.format(s.airingAt * 1000)}${before > 0 ? ` · ${before} ép. déjà sorti${before > 1 ? 's' : ''}, facile à rattraper` : ' · tout premier épisode !'}`;
+  } else if (s.kind === 'backlog') {
+    when = `🕒 Dans ta liste « À voir »${m.episodes ? ` · ${m.episodes} ép.` : ''}`;
+  } else {
+    when = `🍿 Série terminée${m.episodes ? ` · ${m.episodes} ép.` : ''} · parfait pour ce créneau`;
+  }
+  const label = s.kind === 'airing' ? 'Simulcast du jour' : s.kind === 'backlog' ? 'Ton backlog' : 'À binger';
+  return `<div class="sug-card" style="--bimg:${cssUrl(m.banner || m.cover)}">
+    <div class="sug-top"><span class="sug-tag">✦ Créneau libre · ${label}</span><span class="match"><b>${s.pct}%</b> match</span></div>
+    <div class="sug-main" data-act="${inList ? 'open' : 'preview'}" data-uid="${esc(inList ? inList.uid : keyOf(m))}" role="button">
+      ${img(m.cover, 'cv')}
+      <div class="grow">
+        <div class="t">${esc(titleOf(m))}</div>
+        <div class="when">${esc(when)}</div>
+        <div class="meta-line" style="margin-top:6px">${[m.studio, m.score ? '★ ' + m.score.toFixed(1) : null].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join('')}</div>
+        <ul class="why">${s.why.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>
+      </div>
+    </div>
+    <div class="sug-acts">
+      ${inList ? `<button class="btn primary" data-act="sugstart" data-uid="${esc(inList.uid)}">▶ Commencer</button>`
+        : `<button class="btn primary" data-act="sugadd" data-uid="${esc(keyOf(m))}">＋ À voir</button>`}
+      <button class="btn" data-act="sugnext" data-v="${d}">🎲 Un autre</button>
+      <button class="btn ghost" data-act="sugno" data-uid="${esc(keyOf(m))}" aria-label="Pas pour moi">✕</button>
+    </div>
+  </div>`;
 }
 
 /* ---------------- Découvrir ---------------- */
@@ -1561,6 +1778,14 @@ function renderSettings() {
     <div class="slider-row"><span>Flou</span><input type="range" id="wallBlur" min="0" max="30" step="1" value="${w.blur}"><span>${w.blur}px</span></div>
     <div class="slider-row"><span>Assombrir</span><input type="range" id="wallDim" min="0.2" max="0.9" step="0.02" value="${w.dim}"><span>${Math.round(w.dim * 100)}%</span></div>
 
+    ${h2('Suggestions du Simulcast', 'おすすめ')}
+    <div class="seg">
+      <button class="${db.settings.reco !== false ? 'on' : ''}" data-act="recotoggle" data-v="on" style="padding:8px 14px">Activées</button>
+      <button class="${db.settings.reco === false ? 'on' : ''}" data-act="recotoggle" data-v="off" style="padding:8px 14px">Désactivées</button>
+    </div>
+    <p class="tiny muted">Un animé proposé pour chaque jour sans épisode de ta liste, selon tes notes, favoris, genres et tags.${(db.dismissed || []).length ? ` ${db.dismissed.length} animé(s) écarté(s).` : ''}</p>
+    ${(db.dismissed || []).length ? `<button class="btn block" data-act="recoreset">Réinitialiser les animés écartés</button>` : ''}
+
     ${h2('Titres', 'タイトル')}
     <div class="seg">
       <button class="${db.settings.titleLang === 'romaji' ? 'on' : ''}" data-act="lang" data-v="romaji" style="padding:8px 14px">Romaji</button>
@@ -1674,6 +1899,15 @@ const actions = {
     if (!$('#sheet').hidden) renderDetail(); else setTimeout(render, 250);
   },
   gacha: () => openGacha(),
+  sugadd: (el) => { addFromMedia(el.dataset.uid, 'planning', el); setTimeout(render, 300); },
+  sugstart: (el) => { const it = getItem(el.dataset.uid); if (!it) return; setStatus(it, 'watching'); burstFrom(el, 'Ikuzo!'); toast(pick(QUIPS.start)); sched.at = 0; setTimeout(render, 300); },
+  sugnext: (el) => { rerolls[el.dataset.v] = (rerolls[el.dataset.v] || 0) + 1; haptic(); render(); },
+  sugno: (el) => {
+    db.dismissed = [...new Set([...(db.dismissed || []), el.dataset.uid])];
+    save(); toast('Noté, il ne sera plus proposé.'); render();
+  },
+  recotoggle: (el) => { db.settings.reco = el.dataset.v === 'on'; save(); renderSettings(); },
+  recoreset: () => { db.dismissed = []; save(); toast('Animés écartés réinitialisés'); renderSettings(); },
   fstatus: (el) => { ui.status = el.dataset.v; saveUi(); render(); },
   fcat: (el) => { ui.cat = ui.cat === el.dataset.v ? null : el.dataset.v; saveUi(); render(); },
   view: (el) => { ui.view = el.dataset.v; saveUi(); render(); },
