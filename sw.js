@@ -1,5 +1,5 @@
 /* Service worker : appli utilisable hors ligne + cache des affiches */
-const VERSION = 'animes-v2.1.0';
+const VERSION = 'animes-v2.2.0';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 const IMG_CACHE = 'animes-img-v1';
 const IMG_HOSTS = ['s4.anilist.co', 'cdn.myanimelist.net', 'media.kitsu.app', 'media.kitsu.io', 'fonts.googleapis.com', 'fonts.gstatic.com'];

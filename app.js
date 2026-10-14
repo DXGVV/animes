@@ -6,7 +6,7 @@
    Données stockées uniquement sur le téléphone (localStorage)
    ========================================================= */
 
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.2.0';
 const STORE_KEY = 'animes-tom-v1';
 const UI_KEY = 'animes-tom-ui';
 const WALL_KEY = 'animes-tom-wall';
@@ -1042,6 +1042,8 @@ function ensureReco() {
 
 /** Construit la semaine : pour chaque jour sans épisode de ta liste, une suggestion */
 const rerolls = {};
+const altOffset = {};
+let planCtx = null; // candidats de la dernière semaine calculée (pour « Autres idées »)
 function weekPlan(days) {
   if (db.settings.reco === false) return days.map(() => null);
   const prof = tasteProfile();
@@ -1055,6 +1057,7 @@ function weekPlan(days) {
   const catalog = [...backlog, ...(pool?.list || []).filter((e) => ok(e.m)).map((e) => ({ ...e, kind: 'catalog', ...rankCandidate(e.m, prof, e) }))]
     .sort((a, b) => b.r - a.r);
 
+  planCtx = { airing, catalog };
   return days.map((day) => {
     if (day.eps.length) return null;
     const start = day.start / 1000, end = start + 86400;
@@ -1070,6 +1073,21 @@ function weekPlan(days) {
     if (s) used.add(keyOf(s.m));
     return s;
   });
+}
+
+/** Autres idées pour un jour (y compris les jours où tu as déjà un épisode) */
+function dayAlts(day, plan, n = 3) {
+  if (!planCtx) return [];
+  const taken = new Set(plan.filter(Boolean).map((s) => keyOf(s.m)));
+  const start = day.start / 1000, end = start + 86400;
+  const todays = planCtx.airing.filter((c) => c.airingAt >= start && c.airingAt < end && c.pct >= 50 && !taken.has(keyOf(c.m))).sort((a, b) => b.r - a.r);
+  const seen = new Set(todays.map((c) => keyOf(c.m)));
+  const all = [...todays, ...planCtx.catalog.filter((c) => !taken.has(keyOf(c.m)) && !seen.has(keyOf(c.m)))];
+  if (!all.length) return [];
+  const off = (altOffset[day.d] || 0) * n;
+  const out = [];
+  for (let k = 0; k < Math.min(n, all.length); k++) out.push(all[(off + k) % all.length]);
+  return out;
 }
 
 /* =========================================================
@@ -1359,6 +1377,12 @@ function renderPlanning(v) {
         </div>`;
       }).join('')}</div>`;
     }
+    // Autres idées pour ce jour, même s'il est déjà occupé
+    const alts = recoOn ? dayAlts(day, plan, day.eps.length ? 3 : 2) : [];
+    if (alts.length) {
+      html += `${h2(day.eps.length ? 'Et aussi pour toi' : 'Autres idées', 'ほかにも', `<button class="morebtn" data-act="altmore" data-v="${ui.day}">🎲 D'autres</button>`)}
+        <div class="rows">${alts.map(altRowHTML).join('')}</div>`;
+    }
 
     // Vue d'ensemble : un animé par jour
     if (recoOn && plan.some(Boolean)) {
@@ -1400,6 +1424,25 @@ function renderPlanning(v) {
     loadSchedule().then(() => { if (ui.tab === 'planning' && $('#sheet').hidden) renderPlanning($('#view')); });
   }
   ensureReco();
+}
+
+function altRowHTML(s) {
+  const m = s.m;
+  mediaCache.set(keyOf(m), m);
+  const inList = findItem(m);
+  const info = s.kind === 'airing' ? `📡 Ép. ${s.episode} à ${fmtTime.format(s.airingAt * 1000)}`
+    : s.kind === 'backlog' ? '🕒 Ton backlog' : `🍿 Série terminée${m.episodes ? ` · ${m.episodes} ép.` : ''}`;
+  const bimg = m.banner || m.cover;
+  return `<div class="rowcard alt-row ${bimg ? 'bannered' : ''}" ${bimg ? `style="--bimg:${cssUrl(bimg)}"` : ''} data-act="${inList ? 'open' : 'preview'}" data-uid="${esc(inList ? inList.uid : keyOf(m))}" role="button">
+    ${img(m.cover, 'thumb')}
+    <div class="grow"><div class="t">${esc(titleOf(m))}</div>
+      <div class="meta"><b style="color:var(--a2)">${s.pct}% match</b> · ${esc(info)}</div>
+      ${s.why[0] ? `<div class="meta">✦ ${esc(s.why[0])}</div>` : ''}</div>
+    <div class="alt-acts">
+      ${inList ? '' : `<button class="plus1" data-act="sugadd" data-uid="${esc(keyOf(m))}" aria-label="Ajouter à « À voir »">＋</button>`}
+      <button class="alt-no" data-act="sugno" data-uid="${esc(keyOf(m))}" aria-label="Pas pour moi">✕</button>
+    </div>
+  </div>`;
 }
 
 function sugCardHTML(s, d) {
@@ -1901,6 +1944,7 @@ const actions = {
   gacha: () => openGacha(),
   sugadd: (el) => { addFromMedia(el.dataset.uid, 'planning', el); setTimeout(render, 300); },
   sugstart: (el) => { const it = getItem(el.dataset.uid); if (!it) return; setStatus(it, 'watching'); burstFrom(el, 'Ikuzo!'); toast(pick(QUIPS.start)); sched.at = 0; setTimeout(render, 300); },
+  altmore: (el) => { altOffset[el.dataset.v] = (altOffset[el.dataset.v] || 0) + 1; haptic(); render(); },
   sugnext: (el) => { rerolls[el.dataset.v] = (rerolls[el.dataset.v] || 0) + 1; haptic(); render(); },
   sugno: (el) => {
     db.dismissed = [...new Set([...(db.dismissed || []), el.dataset.uid])];

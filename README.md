@@ -10,7 +10,7 @@ Appli perso (PWA) pour suivre mes animés sur iPhone, style « Néon Tokyo ».
 - Notes en tier list S/A/B/C/D, favoris en cartes holo, journal en bulles de manga
 - Fiche : bande-annonce, personnages, suites/préquelles, recommandations
 - Simulcast de la semaine (jours en kanji), épisodes à rattraper
-- Un animé suggéré pour chaque jour libre (simulcast du jour, backlog ou série à binger) selon mes notes et mes goûts
+- Un animé suggéré pour chaque jour libre (simulcast du jour, backlog ou série à binger) selon mes notes et mes goûts, plus d'autres idées chaque jour
 - Fenêtre de statut façon isekai : niveau, rang, classe, 16 succès
 
 ## Mise en ligne (GitHub Pages)
